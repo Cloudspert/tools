@@ -1,0 +1,176 @@
+# =============================================================================
+# nginx-check Job + RBAC   (FluxCD-safe via $$ escaping)
+#
+# FluxCD note:
+#   Flux Kustomization post-build substitution (spec.postBuild) runs envsubst
+#   over the WHOLE manifest and would blank out shell ${...} tokens in the
+#   inline script. To prevent that, every shell variable below is escaped as
+#   $${VAR}. Flux's envsubst turns  $${VAR} -> ${VAR}  (and $$var -> $var),
+#   leaving a correct shell script. Command substitution $( ) and arithmetic
+#   $(( )) need no escaping.  Env VALUES on the container are left un-escaped
+#   so Flux CAN still template them per-environment.
+#
+# Logic:
+#   1. List Ingresses and look for ingressClassName "nginx"
+#      (also matches the legacy `kubernetes.io/ingress.class: nginx` annotation).
+#   2. If `kubectl get ingress` FAILS       -> do nothing (exit 0).
+#   3. If at least one nginx Ingress exists -> do nothing (exit 0).
+#   4. If NO nginx Ingress exists           -> patch the ConfigMap: nginx_install: skip
+# =============================================================================
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nginx-check
+  namespace: default            # <-- namespace where the Job runs
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: nginx-check
+rules:
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "patch"]
+  # Needed by the reconciliation hook to wait for a namespace to be deleted
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: nginx-check
+subjects:
+  - kind: ServiceAccount
+    name: nginx-check
+    namespace: default          # <-- must match the ServiceAccount namespace
+roleRef:
+  kind: ClusterRole
+  name: nginx-check
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nginx-check
+  namespace: default
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        app: nginx-check
+    spec:
+      serviceAccountName: nginx-check
+      restartPolicy: Never
+      containers:
+        - name: nginx-check
+          image: bitnami/kubectl:latest
+          # Env VALUES are NOT escaped -> Flux may still template them per-env
+          # (e.g. TARGET_NAMESPACE: ${cluster_ns}).
+          env:
+            - name: TARGET_NAMESPACE
+              value: "default"
+            - name: TARGET_CONFIGMAP
+              value: "cluster-config"
+            - name: INGRESS_CLASS
+              value: "nginx"
+            - name: WAIT_NAMESPACE
+              value: "nginx-ingress"
+            - name: WAIT_TIMEOUT
+              value: "300"
+            - name: WAIT_INTERVAL
+              value: "5"
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -uo pipefail
+
+              # Defaults: fall back if an env var is empty/unset.
+              INGRESS_CLASS="$${INGRESS_CLASS:-nginx}"
+              TARGET_NAMESPACE="$${TARGET_NAMESPACE:-default}"
+              TARGET_CONFIGMAP="$${TARGET_CONFIGMAP:-cluster-config}"
+              WAIT_NAMESPACE="$${WAIT_NAMESPACE:-}"
+              WAIT_TIMEOUT="$${WAIT_TIMEOUT:-300}"
+              WAIT_INTERVAL="$${WAIT_INTERVAL:-5}"
+
+              # ---------------------------------------------------------------
+              # HOOK: custom reconciliation
+              #   Waits until namespace "$${WAIT_NAMESPACE}" is fully deleted.
+              #   - Returns immediately if the namespace does not exist.
+              #   - Polls every WAIT_INTERVAL seconds.
+              #   - Gives up after WAIT_TIMEOUT seconds (0 = wait forever).
+              # ---------------------------------------------------------------
+              custom_reconcile() {
+                if [ -z "$${WAIT_NAMESPACE:-}" ]; then
+                  echo "[reconcile] WAIT_NAMESPACE not set, nothing to wait for."
+                  return 0
+                fi
+
+                echo "[reconcile] Waiting for namespace '$${WAIT_NAMESPACE}' to be deleted..."
+                local elapsed=0
+                while kubectl get namespace "$${WAIT_NAMESPACE}" >/dev/null 2>&1; do
+                  if [ "$${WAIT_TIMEOUT}" -ne 0 ] && [ "$${elapsed}" -ge "$${WAIT_TIMEOUT}" ]; then
+                    echo "[reconcile] ERROR: namespace '$${WAIT_NAMESPACE}' still present after $${WAIT_TIMEOUT}s."
+                    return 1
+                  fi
+                  echo "[reconcile] Namespace '$${WAIT_NAMESPACE}' still exists, waiting $${WAIT_INTERVAL}s (elapsed $${elapsed}s)..."
+                  sleep "$${WAIT_INTERVAL}"
+                  elapsed=$((elapsed + WAIT_INTERVAL))
+                done
+
+                echo "[reconcile] Namespace '$${WAIT_NAMESPACE}' is gone. Reconciliation complete."
+                return 0
+              }
+
+              echo "[nginx-check] Looking for Ingresses with class '$${INGRESS_CLASS}'..."
+
+              # 1. List ingresses across all namespaces. If this FAILS -> do nothing.
+              if ! ingress_data=$(kubectl get ingress --all-namespaces \
+                    -o jsonpath="{range .items[*]}{.spec.ingressClassName}{'|'}{.metadata.annotations.kubernetes\.io/ingress\.class}{'\n'}{end}" \
+                    2>/tmp/err); then
+                echo "[nginx-check] ERROR: failed to get ingresses:"
+                cat /tmp/err
+                echo "[nginx-check] Doing nothing and exiting cleanly."
+                exit 0
+              fi
+
+              # 2. Count nginx ingresses (modern ingressClassName OR legacy annotation).
+              nginx_count=$(printf '%s\n' "$$ingress_data" | grep -c -w -- "$${INGRESS_CLASS}" || true)
+              nginx_count="$${nginx_count//[^0-9]/}"   # strip anything non-numeric
+              nginx_count="$${nginx_count:-0}"          # empty -> 0
+
+              echo "[nginx-check] Found $${nginx_count} nginx Ingress(es)."
+
+              # 3. At least one nginx ingress -> do nothing.
+              if [ "$${nginx_count}" -gt 0 ]; then
+                echo "[nginx-check] nginx is already installed. No action taken."
+                exit 0
+              fi
+
+              # 4. No nginx ingress -> patch the configmap with nginx_install: skip
+              if [ -z "$${TARGET_CONFIGMAP}" ] || [ -z "$${TARGET_NAMESPACE}" ]; then
+                echo "[nginx-check] ERROR: TARGET_CONFIGMAP/TARGET_NAMESPACE is empty; refusing to patch."
+                exit 1
+              fi
+
+              echo "[nginx-check] No nginx Ingress found. Patching ConfigMap '$${TARGET_CONFIGMAP}' in namespace '$${TARGET_NAMESPACE}'."
+              if kubectl patch configmap "$${TARGET_CONFIGMAP}" \
+                   -n "$${TARGET_NAMESPACE}" \
+                   --type merge \
+                   -p '{"data":{"nginx_install":"skip"}}'; then
+                echo "[nginx-check] ConfigMap patched successfully."
+              else
+                echo "[nginx-check] ERROR: failed to patch ConfigMap."
+                exit 1
+              fi
+
+              # Run custom reconciliation hook (waits for namespace deletion).
+              echo "[nginx-check] Running custom reconciliation hook..."
+              custom_reconcile
