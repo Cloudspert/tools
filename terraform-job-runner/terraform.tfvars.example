@@ -1,0 +1,11 @@
+# copy to terraform.tfvars (git-ignored) or pass with -var / TF_VAR_*
+api_url = "https://api.example.com"
+
+# prefer the env var for the token: export TF_VAR_api_token="..."
+# api_token = "..."
+
+vms = {
+  "vm-01" = "master"
+  "vm-02" = "worker"
+  "vm-03" = "worker"
+}

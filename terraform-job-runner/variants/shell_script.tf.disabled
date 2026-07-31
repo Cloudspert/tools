@@ -1,0 +1,69 @@
+# --------------------------------------------------------------------------
+# VARIANT -- use this instead of terraform_data in main.tf if you want the
+# API RESPONSE (job_id, status, finished_at) stored IN THE STATE, not just
+# the fact that the job ran.
+#
+# A local-exec provisioner cannot return a value, so plain terraform_data can
+# only record "this vm ran". The shell provider adds a resource with a real
+# create/read/delete lifecycle that parses the JSON printed by the script on
+# stdout and keeps it in state.
+#
+# To use it:
+#   1. move this file to ../shell_script.tf (drop the .disabled suffix)
+#   2. comment out (or delete) resource "terraform_data" "job" in main.tf
+#   3. terraform init
+#
+# Same once-per-vm semantics: created on the first apply, untouched afterwards,
+# and shared through the same remote state.
+# --------------------------------------------------------------------------
+
+terraform {
+  required_providers {
+    shell = {
+      source  = "scottwinkler/shell"
+      version = "~> 1.7"
+    }
+  }
+}
+
+provider "shell" {
+  sensitive_environment = {
+    API_TOKEN = var.api_token
+  }
+}
+
+resource "shell_script" "job" {
+  for_each = var.vms
+
+  lifecycle_commands {
+    # stdout of this command must be a json object -> becomes .output
+    create = "${path.module}/scripts/run_job.sh"
+
+    # nothing to read back from the api, so read just echoes what we stored
+    read = "cat $${STATE_FILE} 2>/dev/null || echo '{}'"
+
+    # no api call on destroy, just forget it
+    delete = "true"
+  }
+
+  environment = {
+    API_URL       = var.api_url
+    VM_NAME       = each.key
+    VM_ROLE       = each.value
+    POLL_INTERVAL = tostring(var.poll_interval)
+    JOB_TIMEOUT   = tostring(var.job_timeout)
+    MARKER_DIR    = "${path.module}/.jobs"
+    STATE_FILE    = "${path.module}/.jobs/${each.key}-${each.value}.json"
+    SKIP_IF_DONE  = "1"
+  }
+
+  # relaunch the job for a vm when its role changes
+  triggers = {
+    role = each.value
+  }
+}
+
+output "job_ids" {
+  description = "vm -> job id returned by the api, kept in the state"
+  value       = { for k, s in shell_script.job : k => s.output["job_id"] }
+}
