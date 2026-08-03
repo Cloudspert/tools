@@ -1,4 +1,4 @@
-# =============================================================================
+la
 # nginx-check Job + RBAC   (FluxCD-safe via $$ escaping)
 #
 # FluxCD note:
@@ -80,6 +80,8 @@ spec:
               value: "cluster-config"
             - name: INGRESS_CLASS
               value: "nginx"
+            - name: TREAT_CLASSLESS_AS_NGINX
+              value: "true"
             - name: WAIT_NAMESPACE
               value: "nginx-ingress"
             - name: WAIT_TIMEOUT
@@ -94,6 +96,7 @@ spec:
 
               # Defaults: fall back if an env var is empty/unset.
               INGRESS_CLASS="$${INGRESS_CLASS:-nginx}"
+              TREAT_CLASSLESS_AS_NGINX="$${TREAT_CLASSLESS_AS_NGINX:-true}"
               TARGET_NAMESPACE="$${TARGET_NAMESPACE:-default}"
               TARGET_CONFIGMAP="$${TARGET_CONFIGMAP:-cluster-config}"
               WAIT_NAMESPACE="$${WAIT_NAMESPACE:-}"
@@ -141,12 +144,28 @@ spec:
                 exit 0
               fi
 
-              # 2. Count nginx ingresses (modern ingressClassName OR legacy annotation).
-              nginx_count=$(printf '%s\n' "$$ingress_data" | grep -c -w -- "$${INGRESS_CLASS}" || true)
-              nginx_count="$${nginx_count//[^0-9]/}"   # strip anything non-numeric
-              nginx_count="$${nginx_count:-0}"          # empty -> 0
+              # 2. Count nginx ingresses. Each line is "<ingressClassName>|<legacy annotation>".
+              #    An Ingress counts as nginx when:
+              #      - ingressClassName == nginx                      (modern), OR
+              #      - annotation kubernetes.io/ingress.class == nginx (legacy), OR
+              #      - it has NO class at all (both fields empty) AND the controller
+              #        runs with --watch-ingress-without-class -> such classless
+              #        Ingresses are served by nginx (TREAT_CLASSLESS_AS_NGINX=true).
+              nginx_count=0
+              classless_count=0
+              while IFS= read -r line; do
+                [ -z "$$line" ] && continue           # skip the empty artifact line (0 ingresses)
+                class="$${line%%|*}"                   # field before the first '|'
+                anno="$${line#*|}"                     # field after the first '|'
+                if [ "$$class" = "$${INGRESS_CLASS}" ] || [ "$$anno" = "$${INGRESS_CLASS}" ]; then
+                  nginx_count=$((nginx_count + 1))
+                elif [ -z "$$class" ] && [ -z "$$anno" ] && [ "$${TREAT_CLASSLESS_AS_NGINX}" = "true" ]; then
+                  classless_count=$((classless_count + 1))
+                  nginx_count=$((nginx_count + 1))
+                fi
+              done <<< "$$ingress_data"
 
-              echo "[nginx-check] Found $${nginx_count} nginx Ingress(es)."
+              echo "[nginx-check] Found $${nginx_count} nginx Ingress(es) (of which $${classless_count} classless, served by nginx)."
 
               # 3. At least one nginx ingress -> do nothing.
               if [ "$${nginx_count}" -gt 0 ]; then
